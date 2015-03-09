@@ -1,0 +1,3 @@
+http://android.serverbox.ch/?p=427
+http://android.serverbox.ch/?p=549#app549
+http://developer.android.com/guide/topics/connectivity/usb/accessory.html

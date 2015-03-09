@@ -12,6 +12,7 @@ import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
 import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
+import android.os.SystemClock;
 import android.support.v7.app.ActionBarActivity;
 import android.os.Bundle;
 import android.util.Log;
@@ -22,11 +23,383 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
 
+import java.io.UnsupportedEncodingException;
 import java.util.HashMap;
 import java.util.Iterator;
 
 
 public class MainActivity extends ActionBarActivity {
+
+    private boolean mArduinoConnected = false;
+
+    EditText textStatus;
+
+    private static final int targetVendorID = 9025;
+    //private static final int targetProductID = 32828;
+    UsbDevice deviceFound = null;
+    UsbInterface usbInterfaceFound = null;
+    UsbEndpoint endpointIn = null;
+    UsbEndpoint endpointOut = null;
+
+    private static final String ACTION_USB_PERMISSION =
+            "com.android.example.USB_PERMISSION";
+    PendingIntent mPermissionIntent;
+
+    UsbInterface usbInterface;
+    UsbDeviceConnection usbDeviceConnection;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        textStatus = (EditText) findViewById(R.id.logText);
+
+        //register the broadcast receiver
+        mPermissionIntent = PendingIntent.getBroadcast(this, 0, new Intent(ACTION_USB_PERMISSION), 0);
+        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        registerReceiver(mUsbReceiver, filter);
+
+        registerReceiver(mUsbDeviceReceiver, new IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED));
+        registerReceiver(mUsbDeviceReceiver, new IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED));
+
+        connectUsb();
+
+        final Button button = (Button) findViewById(R.id.moveButton);
+        button.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (mArduinoConnected && usbDeviceConnection != null) {
+                    byte[] bytesHello =
+                            new byte[]{(byte) 'M', 'F', '5', '0', '0', '\n'};
+                    int usbResult = usbDeviceConnection.bulkTransfer(
+                            endpointOut,
+                            bytesHello,
+                            bytesHello.length,
+                            1000); // timeout 1000
+
+                    TextView txt = (TextView) findViewById(R.id.statusText);
+                    txt.setText("bulkTransfer: " + usbResult);
+
+                    EditText log = (EditText) findViewById(R.id.logText);
+                    log.append("bulkTransfer: " + usbResult);
+
+                    //if (usbResult == -1){
+                    //    log.append("searching endpoint\r\n");
+                    //    connectUsb();
+                    //}
+
+                }
+            }
+        });
+    }
+
+    @Override
+    protected void onDestroy() {
+        releaseUsb();
+        unregisterReceiver(mUsbReceiver);
+        unregisterReceiver(mUsbDeviceReceiver);
+        super.onDestroy();
+    }
+
+    private void connectUsb() {
+        textStatus.append("connectUsb()");
+
+        searchEndPoint();
+
+        if (usbInterfaceFound != null) {
+            setupUsbComm();
+            mArduinoConnected = true;
+            TextView txt = (TextView) findViewById(R.id.arduinoConnectionTextView);
+            txt.setTextColor(Color.GREEN);
+            txt.setText(R.string.yes);
+        }
+
+    }
+
+    private void releaseUsb() {
+        textStatus.append("releaseUsb()");
+
+        if (usbDeviceConnection != null) {
+            if (usbInterface != null) {
+                usbDeviceConnection.releaseInterface(usbInterface);
+                usbInterface = null;
+            }
+            usbDeviceConnection.close();
+            usbDeviceConnection = null;
+        }
+
+        deviceFound = null;
+        usbInterfaceFound = null;
+        endpointIn = null;
+        endpointOut = null;
+        mArduinoConnected = false;
+        TextView txt = (TextView) findViewById(R.id.arduinoConnectionTextView);
+        txt.setTextColor(Color.RED);
+        txt.setText(R.string.no);
+    }
+
+    private void searchEndPoint() {
+        usbInterfaceFound = null;
+        endpointOut = null;
+        endpointIn = null;
+
+        //Search device for targetVendorID and targetProductID
+        if (deviceFound == null) {
+            UsbManager manager = (UsbManager) getSystemService(Context.USB_SERVICE);
+            HashMap<String, UsbDevice> deviceList = manager.getDeviceList();
+            Iterator<UsbDevice> deviceIterator = deviceList.values().iterator();
+
+            while (deviceIterator.hasNext()) {
+                UsbDevice device = deviceIterator.next();
+
+                if (device.getVendorId() == targetVendorID) {
+                    deviceFound = device;
+                }
+            }
+        }
+
+        if (deviceFound == null) {
+            textStatus.append("device not found");
+        } else {
+            String s = deviceFound.toString() + "\n" +
+                    "DeviceID: " + deviceFound.getDeviceId() + "\n" +
+                    "DeviceName: " + deviceFound.getDeviceName() + "\n" +
+                    "DeviceClass: " + deviceFound.getDeviceClass() + "\n" +
+                    "DeviceSubClass: " + deviceFound.getDeviceSubclass() + "\n" +
+                    "VendorID: " + deviceFound.getVendorId() + "\n" +
+                    "ProductID: " + deviceFound.getProductId() + "\n" +
+                    "InterfaceCount: " + deviceFound.getInterfaceCount();
+            textStatus.append(s);
+
+            //Search for UsbInterface with Endpoint of USB_ENDPOINT_XFER_BULK,
+            //and direction USB_DIR_OUT and USB_DIR_IN
+
+            for (int i = 0; i < deviceFound.getInterfaceCount(); i++) {
+                UsbInterface usbif = deviceFound.getInterface(i);
+                textStatus.append("Interface Name: " + usbif.toString() + "; Interface N: " + usbif.getId() + "\r\n");
+                UsbEndpoint tOut = null;
+                UsbEndpoint tIn = null;
+
+                int tEndpointCnt = usbif.getEndpointCount();
+                if (tEndpointCnt >= 2) {
+                    for (int j = 0; j < tEndpointCnt; j++) {
+                        if (usbif.getEndpoint(j).getType() ==
+                                UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                            if (usbif.getEndpoint(j).getDirection() ==
+                                    UsbConstants.USB_DIR_OUT) {
+                                tOut = usbif.getEndpoint(j);
+                            } else if (usbif.getEndpoint(j).getDirection() ==
+                                    UsbConstants.USB_DIR_IN) {
+                                tIn = usbif.getEndpoint(j);
+                            }
+                        }
+                    }
+
+                    if (tOut != null && tIn != null) {
+                        //This interface have both USB_DIR_OUT
+                        //and USB_DIR_IN of USB_ENDPOINT_XFER_BULK
+                        usbInterfaceFound = usbif;
+                        endpointOut = tOut;
+                        endpointIn = tIn;
+                    }
+                }
+
+            }
+
+            if (usbInterfaceFound == null) {
+                textStatus.append("No suitable interface found!");
+            } else {
+                textStatus.append(
+                        "UsbInterface found: " + usbInterfaceFound.toString() + "\n\n" +
+                                "Endpoint OUT: " + endpointOut.toString() + "\n\n" +
+                                "Endpoint IN: " + endpointIn.toString());
+            }
+        }
+    }
+
+    private boolean setupUsbComm() {
+
+        //for more info, search SET_LINE_CODING and
+        //SET_CONTROL_LINE_STATE in the document:
+        //"Universal Serial Bus Class Definitions for Communication Devices"
+        //at http://adf.ly/dppFt
+        final int RQSID_SET_LINE_CODING = 0x20;
+        final int RQSID_SET_CONTROL_LINE_STATE = 0x22;
+
+        boolean success = false;
+
+        UsbManager manager = (UsbManager) getSystemService(Context.USB_SERVICE);
+        Boolean permitToRead = manager.hasPermission(deviceFound);
+
+        if (permitToRead) {
+            usbDeviceConnection = manager.openDevice(deviceFound);
+            if (usbDeviceConnection != null) {
+                textStatus.append("Start working with interface " + usbInterfaceFound.getId() + "\n");
+
+                if (!usbDeviceConnection.claimInterface(usbInterfaceFound, true)) {
+                    textStatus.append("Can't claim interface"+ "\n");
+                }
+
+                //showRawDescriptors(); //skip it if you no need show RawDescriptors
+                //SystemClock.sleep(5000);
+
+                //if (!usbDeviceConnection.setInterface(usbInterfaceFound)){
+                    //textStatus.append("Can't set interface"+ "\n");
+                //}
+
+                int usbResult;
+                usbResult = usbDeviceConnection.controlTransfer(
+                        0x21,        //requestType
+                        RQSID_SET_CONTROL_LINE_STATE, //SET_CONTROL_LINE_STATE
+                        0x01,     //value
+                        0,     //index
+                        null,    //buffer
+                        0,     //length
+                        0);    //timeout
+
+                textStatus.append("controlTransfer(SET_CONTROL_LINE_STATE): " + usbResult+ "\n");
+
+                //baud rate = 9600
+                //8 data bit
+                //1 stop bit
+                byte[] encodingSetting =
+                        new byte[]{(byte) 0x80, 0x25, 0x00, 0x00, 0x00, 0x00, 0x08};
+
+                usbResult = usbDeviceConnection.controlTransfer(
+                        0x21,       //requestType
+                        RQSID_SET_LINE_CODING,   //SET_LINE_CODING
+                        0,      //value
+                        0,      //index
+                        encodingSetting,  //buffer
+                        7,      //length
+                        0);     //timeout
+
+                textStatus.append("controlTransfer(RQSID_SET_LINE_CODING): " + usbResult+ "\n");
+
+               /* byte[] bytesHello =
+                        new byte[]{(byte) 'H', 'e', 'l', 'l', 'o', ' ',
+                                'f', 'r', 'o', 'm', ' ',
+                                'A', 'n', 'd', 'r', 'o', 'i', 'd', '\n'};
+                usbResult = usbDeviceConnection.bulkTransfer(
+                        endpointOut,
+                        bytesHello,
+                        bytesHello.length,
+                        10000);*/
+
+                //textStatus.append("bulkTransfer: " + usbResult);
+            }
+
+        } else {
+            manager.requestPermission(deviceFound, mPermissionIntent);
+            textStatus.setText("Permission: " + permitToRead+ "\n");
+        }
+
+
+        return success;
+    }
+
+    private void showRawDescriptors() {
+        final int STD_USB_REQUEST_GET_DESCRIPTOR = 0x06;
+        final int LIBUSB_DT_STRING = 0x03;
+
+        byte[] buffer = new byte[255];
+        int indexManufacturer = 14;
+        int indexProduct = 15;
+        String stringManufacturer = "";
+        String stringProduct = "";
+
+        byte[] rawDescriptors = usbDeviceConnection.getRawDescriptors();
+
+        int lengthManufacturer = usbDeviceConnection.controlTransfer(
+                UsbConstants.USB_DIR_IN | UsbConstants.USB_TYPE_STANDARD,   //requestType
+                STD_USB_REQUEST_GET_DESCRIPTOR,         //request ID for this transaction
+                (LIBUSB_DT_STRING << 8) | rawDescriptors[indexManufacturer], //value
+                0,   //index
+                buffer,  //buffer
+                0xFF,  //length
+                0);   //timeout
+        try {
+            stringManufacturer = new String(buffer, 2, lengthManufacturer - 2, "UTF-16LE");
+        } catch (UnsupportedEncodingException e) {
+            textStatus.setText(e.toString());
+        }
+
+        int lengthProduct = usbDeviceConnection.controlTransfer(
+                UsbConstants.USB_DIR_IN | UsbConstants.USB_TYPE_STANDARD,
+                STD_USB_REQUEST_GET_DESCRIPTOR,
+                (LIBUSB_DT_STRING << 8) | rawDescriptors[indexProduct],
+                0,
+                buffer,
+                0xFF,
+                0);
+        try {
+            stringProduct = new String(buffer, 2, lengthProduct - 2, "UTF-16LE");
+        } catch (UnsupportedEncodingException e) {
+            // TODO Auto-generated catch block
+            e.printStackTrace();
+        }
+
+        textStatus.setText("Manufacturer: " + stringManufacturer + "\n" +
+                "Product: " + stringProduct);
+    }
+
+    private final BroadcastReceiver mUsbReceiver =
+            new BroadcastReceiver() {
+
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    String action = intent.getAction();
+                    if (ACTION_USB_PERMISSION.equals(action)) {
+                        textStatus.setText("ACTION_USB_PERMISSION");
+
+                        synchronized (this) {
+                            UsbDevice device = (UsbDevice) intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+
+                            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                                if (device != null) {
+                                    connectUsb();
+                                }
+                            } else {
+                                textStatus.setText("permission denied for device " + device);
+                            }
+                        }
+                    }
+                }
+            };
+
+    private final BroadcastReceiver mUsbDeviceReceiver =
+            new BroadcastReceiver() {
+
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    String action = intent.getAction();
+                    if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
+
+                        deviceFound = (UsbDevice) intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                        textStatus.setText("ACTION_USB_DEVICE_ATTACHED: \n" +
+                                deviceFound.toString());
+
+                        connectUsb();
+
+                    } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
+
+                        UsbDevice device = (UsbDevice) intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+
+                        textStatus.setText("ACTION_USB_DEVICE_DETACHED: \n" +
+                                device.toString());
+
+                        if (device != null) {
+                            if (device == deviceFound) {
+                                releaseUsb();
+                            }
+                        }
+                    }
+                }
+
+            };
+}
+
+/*
     private static final int targetVendorID= 9025;
 
     private boolean mArduinoConnected = false;
@@ -357,3 +730,4 @@ public class MainActivity extends ActionBarActivity {
 
             };
 }
+*/
